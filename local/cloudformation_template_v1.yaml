@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Pipeline ETL Berka 
+Parameters:
+  YourName:
+    Type: String
+    Description: Tu nombre o identificador unico (solo minusculas, sin espacios)
+    Default: berka
+    AllowedPattern: ^[a-z0-9]+$
+    ConstraintDescription: Solo minusculas y numeros
+  RDSUsername:
+    Type: String
+    Description: Usuario maestro de RDS MySQL
+    Default: admin
+  RDSPassword:
+    Type: String
+    Description: Contraseña de RDS (minimo 8 caracteres)
+    NoEcho: true
+    MinLength: 8
+  AuthorizedIP:
+    Type: String
+    Description: Tu IP publica para acceder a RDS
+    Default: 0.0.0.0/0
+  VpcId:
+    Type: String
+    Description: ID del VPC (dejar vacio para usar VPC por defecto)
+    Default: ''
+
+Resources:
+  # ============================================================================
+  # S3 BUCKET - DATA LAKE
+  # ============================================================================
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${YourName}-datalake-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+          - Id: ProjectExpirationRule
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: AthenaResultsCleanup
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: Berka-ETL
+        - Key: Environment
+          Value: Academic
+
+  # ============================================================================
+  # VPC Y SUBNETS (usando Lambda custom resource)
+  # ============================================================================
+  SubnetFinderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${YourName}-SubnetFinderRole-${AWS::StackName}" #dif
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2DescribePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeRouteTables
+                Resource: "*"
+
+  SubnetFinderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${YourName}-subnet-finder"
+      Handler: index.handler
+      Runtime: python3.11  # Cambiado para compatibilidad
+      Role: !GetAtt SubnetFinderRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+
+          def send_response(event, context, response_status, response_data, physical_resource_id=None):
+              response_url = event['ResponseURL']
+              response_body = json.dumps({
+                  'Status': response_status,
+                  'Reason': 'See CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': physical_resource_id or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }).encode('utf-8')
+              req = urllib.request.Request(response_url, data=response_body, method='PUT')
+              req.add_header('Content-Type', '')
+              urllib.request.urlopen(req)
+
+          def is_subnet_public(ec2, subnet_id):
+              try:
+                  route_tables = ec2.describe_route_tables(
+                      Filters=[{'Name': 'association.subnet-id', 'Values': [subnet_id]}]
+                  )
+                  if not route_tables['RouteTables']:
+                      subnets = ec2.describe_subnets(SubnetIds=[subnet_id])
+                      vpc_id = subnets['Subnets'][0]['VpcId']
+                      route_tables = ec2.describe_route_tables(
+                          Filters=[
+                              {'Name': 'vpc-id', 'Values': [vpc_id]},
+                              {'Name': 'association.main', 'Values': ['true']}
+                          ]
+                      )
+                  for rt in route_tables['RouteTables']:
+                      for route in rt.get('Routes', []):
+                          if route.get('GatewayId', '').startswith('igw-'):
+                              return True
+                  return False
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  return False
+
+          def handler(event, context):
+              ec2 = boto3.client('ec2')
+              vpc_id_param = event['ResourceProperties'].get('VpcId', '')
+              
+              try:
+                  if event['RequestType'] == 'Delete':
+                      send_response(event, context, 'SUCCESS', {})
+                      return
+                  
+                  if not vpc_id_param or vpc_id_param.strip() == '':
+                      vpcs_response = ec2.describe_vpcs(
+                          Filters=[{'Name': 'isDefault', 'Values': ['true']}]
+                      )
+                      if not vpcs_response['Vpcs']:
+                          raise Exception('No default VPC found')
+                      vpc_id = vpcs_response['Vpcs'][0]['VpcId']
+                  else:
+                      vpc_id = vpc_id_param.strip()
+                  
+                  all_subnets = ec2.describe_subnets(
+                      Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
+                  )
+                  
+                  public_subnets = []
+                  for subnet in all_subnets['Subnets']:
+                      if is_subnet_public(ec2, subnet['SubnetId']):
+                          public_subnets.append(subnet)
+                  
+                  public_subnets_by_az = {}
+                  for subnet in public_subnets:
+                      az = subnet['AvailabilityZone']
+                      if az not in public_subnets_by_az:
+                          public_subnets_by_az[az] = []
+                      public_subnets_by_az[az].append(subnet['SubnetId'])
+                  
+                  if len(public_subnets_by_az) < 2:
+                      raise Exception(f'Need at least 2 AZs with public subnets. Found: {len(public_subnets_by_az)}')
+                  
+                  selected_subnets = [subnets[0] for subnets in public_subnets_by_az.values()][:2]
+                  
+                  result = {
+                      'SubnetIds': ','.join(selected_subnets),
+                      'VpcId': vpc_id
+                  }
+                  
+                  send_response(event, context, 'SUCCESS', result)
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+  VPCSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SubnetFinderFunction.Arn
+      VpcId: !Ref VpcId
+
+  # ============================================================================
+  # SECURITY GROUPS
+  # ============================================================================
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPCSubnets
+    Properties:
+      GroupDescription: Security group for RDS MySQL (Public access for academic purposes)
+      VpcId: !GetAtt VPCSubnets.VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+       # SourceSecurityGroupId:
+       #   Ref: LambdaSecurityGroup
+        Description: Allow access from Lambda function
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        CidrIp:
+          Ref: AuthorizedIP
+        Description: Your authorized IP for manual access
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-RDS-SG"
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPCSubnets
+    Properties:
+      GroupDescription: Security group for Glue jobs
+      VpcId: !GetAtt VPCSubnets.VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${YourName}-glue-sg"
+
+  # # Permitir que Glue acceda a RDS
+  RDSFromGlueIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+      Description: Allow Glue jobs to access RDS
+
+  # ============================================================================
+  # RDS MYSQL - FREE TIER (db.t3.micro, 20GB)
+  # ============================================================================
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    DependsOn: VPCSubnets
+    Properties:
+      DBSubnetGroupDescription: Subnet group for private RDS instance
+      SubnetIds:
+        Fn::Split:
+        - ","
+        - Fn::GetAtt:
+          - VPCSubnets
+          - SubnetIds
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-RDS-SubnetGroup"
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    #DeletionPolicy: Snapshot
+    DependsOn:
+      - RDSSecurityGroup
+      - RDSSubnetGroup
+    Properties:
+      DBInstanceIdentifier: !Sub "${YourName}-mysql"
+      AllocatedStorage: '20'
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0.43'
+      MasterUsername: !Ref RDSUsername
+      MasterUserPassword: !Ref RDSPassword
+      DBName: berka_warehouse
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: true
+      BackupRetentionPeriod: 0
+      StorageType: gp2
+      StorageEncrypted: false
+      Tags:
+        - Key: Project
+          Value: Berka-ETL
+        - Key: Environment
+          Value: Academic
+
+  # ============================================================================
+  # IAM ROLES (Sin permisos de Secrets Manager)
+  # ============================================================================
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${YourName}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+              - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+              - arn:aws:iam::aws:policy/AmazonS3FullAccess
+              - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+        - Key: Project
+          Value: Berka-ETL
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${YourName}-lambda-exec-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSControl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:StopDBInstance
+                  - rds:StartDBInstance
+                Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:*"
+
+  # # ============================================================================
+  # # GLUE CONNECTION - RDS (Credenciales directas)
+  # # ============================================================================
+  GlueRDSConnection:
+    Type: AWS::Glue::Connection
+    DependsOn:
+      - RDSInstance
+      - GlueSecurityGroup
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub "${YourName}-rds-connection"
+        Description: JDBC connection to Berka MySQL RDS (credenciales directas)
+        ConnectionType: JDBC
+        PhysicalConnectionRequirements:
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Sub "jdbc:mysql://${RDSInstance.Endpoint.Address}:${RDSInstance.Endpoint.Port}/berka_warehouse?user=${RDSUsername}&password=${RDSPassword}"
+          USERNAME: !Ref RDSUsername
+          PASSWORD: !Ref RDSPassword
+
+  # ============================================================================
+  # GLUE DATA CATALOG DATABASE
+  # ============================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${YourName}db"  # Sin guiones bajos
+        Description: Glue Data Catalog for Berka dataset
+
+  # ============================================================================
+  # GLUE JOBS - FREE TIER (Credenciales directas en argumentos)
+  # ============================================================================
+  
+  # JOB 1: RAW -> PROCESSED
+  GlueJobRawToProcessed:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${YourName}-raw-to-processed"
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/berka_raw_to_processed.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${DataLakeBucket}/spark-logs/"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--JOB_NAME": !Sub "${YourName}-raw-to-processed"
+        "--S3_BUCKET": !Ref DataLakeBucket
+        "--RAW_PREFIX": "raw/berka/"
+        "--PROCESSED_PREFIX": "processed/berka/"
+        "--EXECUTION_MODE": "GLUE"
+      GlueVersion: "4.0"
+      MaxRetries: 0
+      Timeout: 60
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: Berka-ETL
+
+  # JOB 2: PROCESSED -> CURATED
+  GlueJobProcessedToCurated:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${YourName}-processed-to-curated"
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/berka_processed_to_curated.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${DataLakeBucket}/spark-logs/"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--JOB_NAME": !Sub "${YourName}-processed-to-curated"
+        "--S3_BUCKET": !Ref DataLakeBucket
+        "--PROCESSED_PREFIX": "processed/berka/"
+        "--CURATED_PREFIX": "curated/berka/"
+        "--EXECUTION_MODE": "GLUE"
+      GlueVersion: "4.0"
+      MaxRetries: 0
+      Timeout: 60
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Tags:
+        Project: Berka-ETL
+
+  # JOB 3: CURATED -> RDS (Credenciales directas en URL JDBC)
+  GlueJobCuratedToRDS:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${YourName}-curated-to-rds"
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/berka_curated_to_rds.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--enable-metrics": ""
+        "--spark-event-logs-path": !Sub "s3://${DataLakeBucket}/spark-logs/"
+        "--enable-continuous-cloudwatch-log": ""
+        "--JOB_NAME": !Sub "${YourName}-curated-to-rds"
+        "--S3_BUCKET": !Ref DataLakeBucket
+        "--CURATED_PREFIX": "curated/berka/"
+        "--JDBC_URL": !Sub "jdbc:mysql://${RDSInstance.Endpoint.Address}:${RDSInstance.Endpoint.Port}/berka_warehouse"
+        "--JDBC_USER": !Ref RDSUsername
+        "--JDBC_PASSWORD": !Ref RDSPassword
+        "--EXECUTION_MODE": "GLUE"
+    GlueVersion: "4.0"
+    MaxRetries: 0
+    Timeout: 60
+    NumberOfWorkers: 2
+    WorkerType: G.1X
+    MaxConcurrentRuns: 1
+    Tags:
+      - Key: Project
+        Value: Berka-ETL
+
+  # ============================================================================
+  # GLUE CRAWLER - Para catalogar datos curated
+  # ============================================================================
+  GlueCrawlerCurated:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${YourName}-curated-crawler"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucket}/curated/berka/"
+      SchemaChangePolicy:
+        DeleteBehavior: LOG
+        UpdateBehavior: UPDATE_IN_DATABASE
+      Tags:
+        Project: Berka-ETL
+
+  # ============================================================================
+  # ATHENA WORKGROUP
+  # ============================================================================
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${YourName}-workgroup"
+      Description: Athena workgroup for Berka analytics
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataLakeBucket}/athena-results/"
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+      Tags:
+        - Key: Project
+          Value: Berka-ETL
+
+  # ============================================================================
+  # LAMBDA - RDS START/STOP (Opcional para ahorrar costos)
+  # ============================================================================
+  RDSControlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RDSInstance
+    Properties:
+      FunctionName: !Sub "${YourName}-rds-control"
+      Handler: index.handler
+      Runtime: python3.11  # Cambiado para compatibilidad
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          RDS_INSTANCE_ID: !Ref RDSInstance
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          rds = boto3.client('rds')
+          RDS_INSTANCE_ID = os.environ['RDS_INSTANCE_ID']
+
+          def handler(event, context):
+              try:
+                  response = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE_ID)
+                  status = response['DBInstances'][0]['DBInstanceStatus']
+                  print(f"Current status: {status}")
+
+                  if status == 'available':
+                      print(f"Stopping RDS instance...")
+                      rds.stop_db_instance(DBInstanceIdentifier=RDS_INSTANCE_ID)
+                      return {'status': 'Stopping', 'instance': RDS_INSTANCE_ID}
+                  elif status == 'stopped':
+                      print(f"Starting RDS instance...")
+                      rds.start_db_instance(DBInstanceIdentifier=RDS_INSTANCE_ID)
+                      return {'status': 'Starting', 'instance': RDS_INSTANCE_ID}
+                  else:
+                      return {'status': 'NoAction', 'current_status': status}
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'error': str(e)}
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  S3BucketName:
+    Description: Nombre del bucket S3 del Data Lake
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  S3BucketArn:
+    Description: ARN del bucket S3
+    Value: !GetAtt DataLakeBucket.Arn
+
+  RDSEndpoint:
+    Description: Endpoint de la instancia RDS MySQL
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSEndpoint"
+
+  RDSPort:
+    Description: Puerto de RDS
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  RDSConnectionString:
+    Description: String de conexion JDBC para RDS (con credenciales directas)
+    Value: !Sub "jdbc:mysql://${RDSInstance.Endpoint.Address}:${RDSInstance.Endpoint.Port}/berka_warehouse?user=${RDSUsername}&password=${RDSPassword}"
+
+  GlueDatabase:
+    Description: Nombre de la base de datos Glue
+    Value: !Ref GlueDatabase
+
+  GlueConnection:
+    Description: Nombre de la conexion Glue a RDS
+    Value: !Sub "${YourName}-rds-connection"
+
+  GlueJob1:
+    Description: Job RAW -> PROCESSED
+    Value: !Ref GlueJobRawToProcessed
+
+  GlueJob2:
+    Description: Job PROCESSED -> CURATED
+    Value: !Ref GlueJobProcessedToCurated
+
+  GlueJob3:
+    Description: Job CURATED -> RDS
+    Value: !Ref GlueJobCuratedToRDS
+
+  AthenaWorkGroup:
+    Description: Athena WorkGroup para queries
+    Value: !Ref AthenaWorkGroup
+
+  RDSControlLambda:
+    Description: Lambda ARN para start/stop RDS
+    Value: !GetAtt RDSControlFunction.Arn
+
+  QuickStartGuide:
+    Description: Pasos para comenzar
+    Value: !Sub |
+      1. Subir scripts: aws s3 cp scripts/ s3://${DataLakeBucket}/scripts/ --recursive
+      2. Subir datos raw: aws s3 cp data/raw/berka/ s3://${DataLakeBucket}/raw/berka/ --recursive
+      3. Ejecutar Job 1: aws glue start-job-run --job-name ${GlueJobRawToProcessed}
+      4. Ejecutar Job 2: aws glue start-job-run --job-name ${GlueJobProcessedToCurated}
+      5. Ejecutar Job 3: aws glue start-job-run --job-name ${GlueJobCuratedToRDS}
+      6. Conectar a RDS: mysql -h ${RDSInstance.Endpoint.Address} -u ${RDSUsername} -p${RDSPassword} berka_warehouse

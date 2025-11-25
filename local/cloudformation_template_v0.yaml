@@ -1,0 +1,520 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Plantilla Simplificada de CloudFormation para un Pipeline de Data Engineering
+  (S3, RDS Publico, Glue, Athena). Optimizado para 2 semanas de duracion y apagado
+  On-Demand.
+Parameters:
+  DatasetName:
+    Type: String
+    Description: Nombre del conjunto de datos.
+    Default: data
+  YourName:
+    Type: String
+    Description: Tu nombre o un identificador unico (solo minusculas, sin espacios).
+  RDSDatabaseName:
+    Type: String
+    Description: Nombre de la base de datos MySQL en RDS.
+    Default: datadb
+  RDSUsername:
+    Type: String
+    Description: Nombre de usuario maestro de RDS.
+    Default: masteruser
+  RDSPassword:
+    Type: String
+    Description: Contraseña maestra de RDS.
+    NoEcho: true
+  AuthorizedIP:
+    Type: String
+    Description: Tu IP publica autorizada para acceder a RDS
+    Default: 181.46.166.103/32
+  VpcId:
+    Type: String
+    Description: ID del VPC donde se crear RDS. Si no se especifica, se usar el VPC
+      por defecto automaticamente.
+    Default: ''
+Resources:
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPCSubnets
+    Properties:
+      GroupDescription: Security group for Lambda function to access RDS
+      VpcId:
+        Fn::GetAtt:
+        - VPCSubnets
+        - VpcId
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-Lambda-SG"
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+    - VPCSubnets
+    - LambdaSecurityGroup
+    Properties:
+      GroupDescription: Security group for private RDS instance. Allows connections
+        from Lambda only.
+      VpcId:
+        Fn::GetAtt:
+        - VPCSubnets
+        - VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId:
+          Ref: LambdaSecurityGroup
+        Description: Allow access from Lambda function
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        CidrIp:
+          Ref: AuthorizedIP
+        Description: Your authorized IP for manual access
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-RDS-SG"
+  SubnetFinderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: EC2DescribePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:DescribeSubnets
+            - ec2:DescribeVpcs
+            - ec2:DescribeRouteTables
+            Resource: "*"
+  SubnetFinderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: "${YourName}-SubnetFinder"
+      Handler: index.handler
+      Runtime: python3.12
+      Role:
+        Fn::GetAtt:
+        - SubnetFinderRole
+        - Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: "import json\nimport boto3\nimport urllib.request\n\ndef send_response(event,
+          context, response_status, response_data, physical_resource_id=None):\n    response_url
+          = event['ResponseURL']\n    response_body = json.dumps({\n        'Status':
+          response_status,\n        'Reason': 'See the details in CloudWatch Log Stream:
+          ' + context.log_stream_name,\n        'PhysicalResourceId': physical_resource_id
+          or context.log_stream_name,\n        'StackId': event['StackId'],\n        'RequestId':
+          event['RequestId'],\n        'LogicalResourceId': event['LogicalResourceId'],\n
+          \       'Data': response_data\n    }).encode('utf-8')\n    req = urllib.request.Request(response_url,
+          data=response_body, method='PUT')\n    req.add_header('Content-Type', '')\n
+          \   urllib.request.urlopen(req)\n\ndef is_subnet_public(ec2, subnet_id):\n
+          \   \"\"\"Verifica si una subnet es publica revisando su route table.\"\"\"\n
+          \   try:\n        # Obtener la route table asociada a la subnet\n        route_tables
+          = ec2.describe_route_tables(\n            Filters=[{'Name': 'association.subnet-id',
+          'Values': [subnet_id]}]\n        )\n        \n        # Si no hay route
+          table asociada directamente, buscar la main route table del VPC\n        if
+          not route_tables['RouteTables']:\n            # Obtener el VPC de la subnet\n
+          \           subnets = ec2.describe_subnets(SubnetIds=[subnet_id])\n            vpc_id
+          = subnets['Subnets'][0]['VpcId']\n            \n            # Buscar la
+          main route table del VPC\n            route_tables = ec2.describe_route_tables(\n
+          \               Filters=[\n                    {'Name': 'vpc-id', 'Values':
+          [vpc_id]},\n                    {'Name': 'association.main', 'Values': ['true']}\n
+          \               ]\n            )\n        \n        # Verificar si alguna
+          route table tiene una ruta a un Internet Gateway\n        for rt in route_tables['RouteTables']:\n
+          \           for route in rt.get('Routes', []):\n                if route.get('GatewayId',
+          '').startswith('igw-'):\n                    return True\n        \n        return
+          False\n    except Exception as e:\n        print(f'Error verificando subnet
+          {subnet_id}: {str(e)}')\n        # Por defecto, si no se puede determinar,
+          usar map-public-ip-on-launch\n        subnets = ec2.describe_subnets(SubnetIds=[subnet_id])\n
+          \       return subnets['Subnets'][0].get('MapPublicIpOnLaunch', False)\n\ndef
+          handler(event, context):\n    ec2 = boto3.client('ec2')\n    vpc_id_param
+          = event['ResourceProperties'].get('VpcId', '')\n    \n    try:\n        if
+          event['RequestType'] == 'Delete':\n            send_response(event, context,
+          'SUCCESS', {})\n            return\n        \n        # Si no se proporciona
+          VPC, buscar el VPC por defecto\n        if not vpc_id_param or vpc_id_param.strip()
+          == '':\n            print('VPC no proporcionado, buscando VPC por defecto...')\n
+          \           vpcs_response = ec2.describe_vpcs(\n                Filters=[{'Name':
+          'isDefault', 'Values': ['true']}]\n            )\n            if not vpcs_response['Vpcs']:\n
+          \               raise Exception('No se encontra un VPC por defecto. Por
+          favor, proporciona un VpcId.')\n            vpc_id = vpcs_response['Vpcs'][0]['VpcId']\n
+          \           print(f'VPC por defecto encontrado: {vpc_id}')\n        else:\n
+          \           vpc_id = vpc_id_param.strip()\n            print(f'Usando VPC
+          proporcionado: {vpc_id}')\n        \n        # Obtener todas las subnets
+          del VPC\n        all_subnets = ec2.describe_subnets(\n            Filters=[{'Name':
+          'vpc-id', 'Values': [vpc_id]}]\n        )\n        \n        print(f'Total
+          de subnets encontradas: {len(all_subnets[\"Subnets\"])}')\n        \n        #
+          Clasificar subnets en publicas y privadas\n        public_subnets = []\n
+          \       private_subnets = []\n        \n        for subnet in all_subnets['Subnets']:\n
+          \           subnet_id = subnet['SubnetId']\n            if is_subnet_public(ec2,
+          subnet_id):\n                public_subnets.append(subnet)\n                print(f'Subnet
+          {subnet_id} identificada como PuBLICA')\n            else:\n                private_subnets.append(subnet)\n
+          \               print(f'Subnet {subnet_id} identificada como PRIVADA')\n
+          \       \n        # Agrupar subnets publicas por Availability Zone\n        public_subnets_by_az
+          = {}\n        for subnet in public_subnets:\n            az = subnet['AvailabilityZone']\n
+          \           if az not in public_subnets_by_az:\n                public_subnets_by_az[az]
+          = []\n            public_subnets_by_az[az].append(subnet['SubnetId'])\n
+          \       \n        # Agrupar subnets privadas por Availability Zone\n        private_subnets_by_az
+          = {}\n        for subnet in private_subnets:\n            az = subnet['AvailabilityZone']\n
+          \           if az not in private_subnets_by_az:\n                private_subnets_by_az[az]
+          = []\n            private_subnets_by_az[az].append(subnet['SubnetId'])\n
+          \       \n        print(f'Subnets publicas por AZ: {len(public_subnets_by_az)}')\n
+          \       print(f'Subnets privadas por AZ: {len(private_subnets_by_az)}')\n
+          \       \n        # Seleccionar subnets publicas (minimo 2 AZs requeridas
+          para RDS)\n        if len(public_subnets_by_az) < 2:\n            raise
+          Exception(f'Se requieren subnets publicas en al menos 2 zonas de disponibilidad.
+          Encontradas: {len(public_subnets_by_az)}')\n        \n        selected_public_subnets
+          = [subnets[0] for subnets in public_subnets_by_az.values()]\n        selected_public_subnets
+          = selected_public_subnets[:2]\n        \n        # Seleccionar subnets privadas
+          (minimo 2 AZs para Lambda y RDS)\n        # Si no hay suficientes subnets
+          privadas, usar las publicas como fallback\n        if len(private_subnets_by_az)
+          < 2:\n            print(f'Advertencia: Solo se encontraron {len(private_subnets_by_az)}
+          AZs con subnets privadas. Usando subnets publicas como fallback.')\n            selected_private_subnets
+          = selected_public_subnets\n        else:\n            selected_private_subnets
+          = [subnets[0] for subnets in private_subnets_by_az.values()]\n            selected_private_subnets
+          = selected_private_subnets[:2]\n        \n        result = {\n            'SubnetIds':
+          ','.join(selected_public_subnets),\n            'PrivateSubnetIds': ','.join(selected_private_subnets),\n
+          \           'VpcId': vpc_id\n        }\n        \n        print(f'Resultado:
+          Subnets publicas={result[\"SubnetIds\"]}, Subnets privadas={result[\"PrivateSubnetIds\"]}')\n
+          \       send_response(event, context, 'SUCCESS', result)\n    except Exception
+          as e:\n        print(f'Error: {str(e)}')\n        send_response(event, context,
+          'FAILED', {'Error': str(e)})\n"
+  VPCSubnets:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+        - SubnetFinderFunction
+        - Arn
+      VpcId:
+        Ref: VpcId
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    DependsOn: VPCSubnets
+    Properties:
+      DBSubnetGroupDescription: Subnet group for private RDS instance
+      SubnetIds:
+        Fn::Split:
+        - ","
+        - Fn::GetAtt:
+          - VPCSubnets
+          - PrivateSubnetIds
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-RDS-SubnetGroup"
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: "${DatasetName}-${YourName}-2025"
+      VersioningConfiguration:
+        Status: Suspended
+      LifecycleConfiguration:
+        Rules:
+        - Id: ProjectExpirationRule
+          Status: Enabled
+          ExpirationInDays: 20
+        - Id: AthenaResultsCleanup
+          Status: Enabled
+          Prefix: athena-results/
+          ExpirationInDays: 7
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: DataPipeline-${DatasetName}-${YourName}
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    DependsOn:
+    - RDSSecurityGroup
+    - RDSSubnetGroup
+    Properties:
+      DBInstanceIdentifier:
+        Fn::Sub: "${YourName}-${DatasetName}-rds"
+      AllocatedStorage: '20'
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername:
+        Ref: RDSUsername
+      MasterUserPassword:
+        Ref: RDSPassword
+      DBName:
+        Ref: RDSDatabaseName
+      DBSubnetGroupName:
+        Ref: RDSSubnetGroup
+      VPCSecurityGroups:
+      - Ref: RDSSecurityGroup
+      PubliclyAccessible: true
+      Tags:
+      - Key: Schedule
+        Value: AutoStop
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-DataDB"
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: glue.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-Glue-Role"
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: RDSControlPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - rds:DescribeDBInstances
+            - rds:StopDBInstance
+            - rds:StartDBInstance
+            Resource:
+              Fn::Sub: arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:*
+  RDSStopperFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - RDSInstance
+    Properties:
+      FunctionName:
+        Fn::Sub: "${YourName}-RDS-StopStart-OnDemand"
+      Handler: index.handler
+      Runtime: python3.12
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          RDS_INSTANCE_IDENTIFIER:
+            Ref: RDSInstance
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          rds = boto3.client('rds')
+          RDS_INSTANCE_IDENTIFIER = os.environ.get('RDS_INSTANCE_IDENTIFIER', '')
+
+          def handler(event, context):
+              """
+              Detiene o inicia la instancia RDS con el ID proporcionado por la variable de entorno.
+              """
+              print(f"Evento recibido: {json.dumps(event)}")
+              db_instance_id = event.get('db_instance_id', RDS_INSTANCE_IDENTIFIER)
+
+              if not db_instance_id:
+                  print("ERROR: ID de instancia RDS no proporcionado.")
+                  return {'statusCode': 400, 'body': 'DB instance ID missing.'}
+
+              try:
+                  response = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+                  status = response['DBInstances'][0]['DBInstanceStatus']
+                  print(f"Instancia {db_instance_id} tiene estado: {status}")
+
+                  if status == 'available':
+                      print(f"Deteniendo instancia {db_instance_id}...")
+                      rds.stop_db_instance(DBInstanceIdentifier=db_instance_id)
+                      return {'status': 'Stopping', 'instance_id': db_instance_id}
+                  elif status == 'stopped':
+                      print(f"Iniciando instancia {db_instance_id}...")
+                      rds.start_db_instance(DBInstanceIdentifier=db_instance_id)
+                      return {'status': 'Starting', 'instance_id': db_instance_id}
+                  else:
+                      print(f"Instancia {db_instance_id} esta en estado '{status}'. No se tomara ninguna accion.")
+                      return {'status': 'NoAction', 'instance_id': db_instance_id, 'reason': f"Current status is {status}"}
+
+              except Exception as e:
+                  print(f"Error al controlar RDS: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+  GlueDataCatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: "${DatasetName}_${YourName}_db"
+  GlueRDSConnection:
+    Type: AWS::Glue::Connection
+    DependsOn: RDSInstance
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      ConnectionInput:
+        Name:
+          Fn::Sub: "${YourName}-RDS-MySQL"
+        Description: Conexion JDBC para Glue a la instancia RDS MySQL (endpoint publico).
+        ConnectionType: JDBC
+        ConnectionProperties:
+          JDBC_CONNECTION_URL:
+            Fn::Sub: jdbc:mysql://${RDSInstance.Endpoint.Address}:${RDSInstance.Endpoint.Port}/${RDSDatabaseName}
+          USERNAME:
+            Ref: RDSUsername
+          PASSWORD:
+            Ref: RDSPassword
+  GlueCrawlerCurated:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name:
+        Fn::Sub: "${YourName}-Curated-Crawler"
+      Role:
+        Fn::GetAtt:
+        - GlueServiceRole
+        - Arn
+      DatabaseName:
+        Ref: GlueDataCatalogDatabase
+      Targets:
+        S3Targets:
+        - Path:
+            Fn::Sub: s3://${DataLakeBucket}/curated/
+      SchemaChangePolicy:
+        DeleteBehavior: LOG
+  GlueJobRawCSVTransform:
+    Type: AWS::Glue::Job
+    Properties:
+      Name:
+        Fn::Sub: "${YourName}-RawCSV-to-S3-Processed"
+      Role:
+        Fn::GetAtt:
+        - GlueServiceRole
+        - Arn
+      Command:
+        Name: glueetl
+        ScriptLocation:
+          Fn::Sub: s3://${DataLakeBucket}/scripts/raw_csv_transform.py
+        PythonVersion: 3
+      GlueVersion: '4.0'
+      WorkerType: Standard
+      NumberOfWorkers: 2
+  GlueJobCuratedAggregate:
+    Type: AWS::Glue::Job
+    Properties:
+      Name:
+        Fn::Sub: "${YourName}-Processed-to-S3-Curated"
+      Role:
+        Fn::GetAtt:
+        - GlueServiceRole
+        - Arn
+      Command:
+        Name: glueetl
+        ScriptLocation:
+          Fn::Sub: s3://${DataLakeBucket}/scripts/curated_aggregate.py
+        PythonVersion: 3
+      GlueVersion: '4.0'
+      WorkerType: Standard
+      NumberOfWorkers: 2
+  GlueJobCuratedToRDS:
+    Type: AWS::Glue::Job
+    DependsOn: GlueRDSConnection
+    Properties:
+      Name: !Sub "${YourName}-Curated-to-RDS"
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${DataLakeBucket}/scripts/curated_to_rds.py"
+        PythonVersion: 3
+      Connections:
+        Connections:
+          - !Sub "${YourName}-RDS-MySQL"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${DataLakeBucket}/spark-logs/"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--SOURCE_PATH": !Sub "s3://${DataLakeBucket}/curated/"
+        "--DATABASE_NAME": !Ref GlueDataCatalogDatabase
+        # Parámetros de conexión JDBC (disponibles en el script)
+        "--JDBC_URL": !Sub "jdbc:mysql://${RDSInstance.Endpoint.Address}:${RDSInstance.Endpoint.Port}/${RDSDatabaseName}"
+        "--JDBC_USER": !Ref RDSUsername
+        "--JDBC_PASSWORD": !Ref RDSPassword
+        "--TARGET_TABLE": "analytics_results"  # Tabla destino en RDS
+      GlueVersion: '4.0'
+      WorkerType: Standard
+      NumberOfWorkers: 2
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name:
+        Fn::Sub: "${YourName}-workgroup"
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation:
+            Fn::Sub: s3://${DataLakeBucket}/athena-results/
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: "${YourName}-Athena-WG"
+Outputs:
+  S3BucketName:
+    Description: Nombre del Bucket S3 del Data Lake.
+    Value:
+      Ref: DataLakeBucket
+  RDSInstanceEndpoint:
+    Description: Endpoint de la instancia RDS MySQL (PRIVADO - solo accesible desde
+      dentro del VPC).
+    Value:
+      Fn::GetAtt:
+      - RDSInstance
+      - Endpoint.Address
+  GlueCatalogDatabase:
+    Description: Nombre de la base de datos de Glue Data Catalog.
+    Value:
+      Ref: GlueDataCatalogDatabase
+  LambdaStopStartFunction:
+    Description: ARN de la funcion Lambda para detener/iniciar la instancia RDS On-Demand.
+      Invocala para controlar el estado.
+    Value:
+      Fn::GetAtt:
+      - RDSStopperFunction
+      - Arn
+  RDSAccessNote:
+    Description: IMPORTANTE - RDS está en subnets privadas y solo es accesible desde
+      recursos dentro del VPC (como Lambda). No es accesible desde Internet.
+    Value: RDS privado - Acceso solo desde VPC
+  AthenaWorkGroupName:
+    Description: Nombre del WorkGroup de Athena para ejecutar las consultas (Semana
+      2).
+    Value:
+      Ref: AthenaWorkGroup

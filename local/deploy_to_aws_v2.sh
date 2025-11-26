@@ -12,16 +12,19 @@ echo "======================================================================"
 # ==============================================================================
 # CONFIGURACIÓN - ACTUALIZAR ESTOS VALORES
 # ==============================================================================
-YOUR_NAME="berka"  # Debe ser igual al parámetro 'YourName' en el template
-RDS_USERNAME="admin"
-RDS_PASSWORD="BerkaPassword123!"  # ¡Asegúrate de que coincida con tu valor real!
-AUTHORIZED_IP="$(curl -s https://api.ipify.org)/32"  # Obtiene tu IP actual
+source .env
+
+AUTHORIZED_IP="$(curl -s https://api.ipify.org)/32" 
 STACK_NAME="berka-pipeline"
 REGION="us-east-1" 
-VPC_ID=""  # ID del VPC (dejar vacío para usar el por defecto)
-CLOUDFORMATION_FILE="./cloudformation_template_v2.yaml" # <--- NOMBRE ACTUALIZADO
+VPC_ID=""  
+CLOUDFORMATION_FILE="./cloudformation_template_v6.yaml" 
 SCRIPTS_DIR="../glue-jobs/"
 RAW_DATA_DIR="./data/raw/berka/"
+
+JOB_RAW_TO_PROCESSED="raw_to_processed.py"
+JOB_PROCESSED_TO_CURATED="processed_to_curated.py"
+JOB_CURATED_TO_RDS="berka_curated_to_rds.py"
 
 echo ""
 echo "📋 Configuración:"
@@ -59,6 +62,20 @@ if [ ! -d "$SCRIPTS_DIR" ]; then
     echo "❌ ERROR: No se encuentra el directorio de scripts: $SCRIPTS_DIR"
     exit 1
 fi
+
+# Verificar que existen los 3 scripts clave
+declare -a REQUIRED_SCRIPTS=(
+  $JOB_RAW_TO_PROCESSED
+  $JOB_PROCESSED_TO_CURATED
+  $JOB_CURATED_TO_RDS
+)
+
+for script in "${REQUIRED_SCRIPTS[@]}"; do
+  if [ ! -f "$SCRIPTS_DIR/$script" ]; then
+    echo "❌ ERROR: Script no encontrado: $SCRIPTS_DIR/$script"
+    exit 1
+  fi
+done
 
 echo "✅ Prerequisitos OK"
 echo ""
@@ -158,45 +175,32 @@ echo ""
 # SUBIR SCRIPTS PYTHON A S3
 # ==============================================================================
 echo "5/8. Subiendo scripts Python a S3..."
-
-# Verificar que los scripts existen
-declare -a REQUIRED_SCRIPTS=(
-  "raw_csv_transform_w_local.py"
-  "curated_job.py"
-  "berka_curated_to_rds.py"
-)
-
-for script in "${REQUIRED_SCRIPTS[@]}"; do
-  if [ ! -f "$SCRIPTS_DIR/$script" ]; then
-    echo "❌ ERROR: Script no encontrado: $SCRIPTS_DIR/$script"
-    exit 1
-  fi
-done
-
-# Subir scripts con nombres correctos para Glue
 SCRIPTS_DEST="s3://$BUCKET_NAME/scripts"
 
-echo "   Subiendo raw_csv_transform_w_local.py -> berka_raw_to_processed.py..."
-if ! aws s3 cp "$SCRIPTS_DIR/raw_csv_transform_w_local.py" \
+# Subir Job 1: RAW -> PROCESSED
+echo "   Subiendo $JOB_RAW_TO_PROCESSED -> berka_raw_to_processed.py..."
+if ! aws s3 cp "$SCRIPTS_DIR/$JOB_RAW_TO_PROCESSED" \
   "$SCRIPTS_DEST/berka_raw_to_processed.py" \
   --region "$REGION"; then
-  echo "❌ ERROR: Fallo al subir script raw_csv_transform_w_local.py"
+  echo "❌ ERROR: Fallo al subir script $JOB_RAW_TO_PROCESSED"
   exit 1
 fi
 
-echo "   Subiendo curated_job.py -> berka_processed_to_curated.py..."
-if ! aws s3 cp "$SCRIPTS_DIR/curated_job.py" \
+# Subir Job 2: PROCESSED -> CURATED
+echo "   Subiendo $JOB_PROCESSED_TO_CURATED -> berka_processed_to_curated.py..."
+if ! aws s3 cp "$SCRIPTS_DIR/$JOB_PROCESSED_TO_CURATED" \
   "$SCRIPTS_DEST/berka_processed_to_curated.py" \
   --region "$REGION"; then
-  echo "❌ ERROR: Fallo al subir script curated_job.py"
+  echo "❌ ERROR: Fallo al subir script $JOB_PROCESSED_TO_CURATED"
   exit 1
 fi
 
-echo "   Subiendo berka_curated_to_rds.py..."
-if ! aws s3 cp "$SCRIPTS_DIR/berka_curated_to_rds.py" \
-  "$SCRIPTS_DEST/berka_curated_to_rds.py" \
+# Subir Job 3: CURATED -> RDS
+echo "   Subiendo $JOB_CURATED_TO_RDS..."
+if ! aws s3 cp "$SCRIPTS_DIR/$JOB_CURATED_TO_RDS" \
+  "$SCRIPTS_DEST/$JOB_CURATED_TO_RDS" \
   --region "$REGION"; then
-  echo "❌ ERROR: Fallo al subir script berka_curated_to_rds.py"
+  echo "❌ ERROR: Fallo al subir script $JOB_CURATED_TO_RDS"
   exit 1
 fi
 
@@ -235,6 +239,7 @@ echo "2. Ejecuta el Job 2 (PROCESSED -> CURATED):"
 echo "   aws glue start-job-run --job-name ${YOUR_NAME}-processed-to-curated --region $REGION"
 echo "3. Ejecuta el CRAWLER (para catalogar los datos curados):"
 echo "   aws glue start-crawler --name ${YOUR_NAME}-curated-crawler --region $REGION"
+echo "   (Espera a que el crawler termine antes del paso 4)"
 echo "4. Ejecuta el Job 3 (CURATED -> RDS):"
 echo "   aws glue start-job-run --job-name ${YOUR_NAME}-curated-to-rds --region $REGION"
 echo "5. Detener RDS (para ahorrar costos):"

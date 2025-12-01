@@ -20,11 +20,11 @@ REGION="us-east-1"
 VPC_ID=""  
 CLOUDFORMATION_FILE="./cloudformation_template_v6.yaml" 
 SCRIPTS_DIR="../glue-jobs/"
-RAW_DATA_DIR="./data/raw/berka/"
+RAW_DATA_DIR="./data_original"
 
 JOB_RAW_TO_PROCESSED="raw_to_processed.py"
 JOB_PROCESSED_TO_CURATED="processed_to_curated.py"
-JOB_CURATED_TO_RDS="berka_curated_to_rds.py"
+JOB_CURATED_TO_RDS="berka_curated_to_rds_v1.py"
 
 echo ""
 echo "📋 Configuración:"

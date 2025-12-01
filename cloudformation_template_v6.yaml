@@ -21,7 +21,6 @@ Parameters:
     Description: Contraseña de RDS (minimo 8 caracteres)
     NoEcho: true
     MinLength: 8
-    Default: BerkaPassword123!
 
   AuthorizedIP:
     Type: String
@@ -749,3 +748,6 @@ Outputs:
       
       5. Conectar a RDS:
          mysql -h ${RDSInstance.Endpoint.Address} -u ${RDSUsername} -p berka_warehouse
+
+
+#fix de consola: agregar las 2 sg en la coneccion de glue.

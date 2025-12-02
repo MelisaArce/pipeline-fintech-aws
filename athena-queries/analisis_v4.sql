@@ -1,17 +1,8 @@
 -- ============================================================================
--- 🏦 SCRIPT DE ANÁLISIS DE NEGOCIO Y RIESGO - BERKA FINTECH 🏦
--- Base de Datos: berkafintech_db (Debe estar registrada en el Data Catalog de Glue)
--- Motor de Consulta: Amazon Athena (Optimizado para Parquet/Particiones)
--- Versión: 2.1 (Combinada y Optimizada)
---
+-- 🏦 SCRIPT DE ANÁLISIS DE NEGOCIO Y RIESGO - BERKA FINTECH 
 -- OBJETIVO: Profundizar en el análisis del comportamiento del cliente y
 --           la detección de riesgo/anomalías para la gerencia de una Fintech.
 -- ============================================================================
-
--- Configurar workgroup de Athena con la ubicación de resultados (opcional, se hace en la consola)
--- SET query_result_location = 's3://[TU-BUCKET-RESULTADOS]/athena/query_results/';
-
-
 -- ============================================================================
 -- 1. CREACIÓN DE VISTAS (Optimización y Reutilización)
 -- PROPÓSITO: Simplificar consultas complejas al pre-unir tablas clave.
@@ -34,9 +25,9 @@ SELECT
     t.final_balance,
     t.is_amount_outlier
 FROM berkafintech_db.dim_client c
-JOIN berkafintech_db.dim_account a ON c.client_id = a.owner_client_id -- Unimos el cliente propietario de la cuenta
+JOIN berkafintech_db.dim_account a ON c.client_id = a.owner_client_id 
 JOIN berkafintech_db.fact_transactions t ON a.account_id = t.account_id
-WITH NO DATA; -- Mejor práctica en Athena para vistas sin materializar
+WITH NO DATA;
 
 -- 1.2 Vista: v_loan_risk_analysis (Análisis de riesgo crediticio y contexto económico)
 -- UNE: Préstamos (riesgo) + Cuenta + Distrito (contexto económico).
@@ -72,8 +63,6 @@ SELECT
     a.account_age_years,
     a.account_age_segment,
     a.owner_client_id,
-    
-    -- Métricas de Transacciones (desde fact_account_transactions)
     t.total_transactions,
     t.total_income_amount,
     t.total_expense_amount,
@@ -87,6 +76,7 @@ FROM berkafintech_db.dim_account a
 -- Usamos LEFT JOIN para incluir cuentas que no tienen transacciones (Inactivas)
 LEFT JOIN berkafintech_db.fact_account_transactions t 
     ON a.account_id = t.account_id;
+
 -- ============================================================================
 -- 2. ANÁLISIS DE RIESGO CREDITICIO Y CARTERA
 -- ============================================================================
@@ -138,7 +128,6 @@ FROM berkafintech_db.v_loan_risk_analysis
 GROUP BY region
 HAVING COUNT(loan_id) > 10 -- Filtra regiones con pocos préstamos para estabilidad estadística
 ORDER BY tasa_default_pct DESC;
-
 
 -- ============================================================================
 -- 3. ANÁLISIS DE COMPORTAMIENTO Y ENGAGEMENT
@@ -194,7 +183,6 @@ JOIN berkafintech_db.fact_transactions t ON a.account_id = t.account_id
 GROUP BY a.frequency, t.type, t.operation
 ORDER BY num_transacciones DESC;
 
-
 -- ============================================================================
 -- 4. DETECCIÓN DE FRAUDE Y ANOMALÍAS
 -- ============================================================================
@@ -217,11 +205,9 @@ WHERE is_amount_outlier = 1
 ORDER BY trans_amount DESC
 LIMIT 100;
 
-
 -- ============================================================================
 -- 5. RESUMEN EJECUTIVO (KPIs)
 -- ============================================================================
-
 -- 5.1 Dashboard ejecutivo - Métricas clave
 -- PROPÓSITO: Presentación de los KPIs de negocio más críticos en un formato de tabla simple (usado en QuickSight).
 SELECT 

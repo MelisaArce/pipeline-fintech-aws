@@ -14,7 +14,6 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock"
     networks:
       - berka_network 
-
   mysql:
     image: mysql:8.0
     container_name: berka_mysql_db 

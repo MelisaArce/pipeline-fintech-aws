@@ -1,6 +1,17 @@
-# 🧪 EDA del Dataset Berka
+<div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+  
+  <div style="flex: 1;">
+    <h1>🧪 EDA del Dataset Berka</h1>
+    <p>
+      Este documento resume el Análisis Exploratorio de Datos (EDA) que realicé sobre el Dataset Bancario Berka. Este análisis fue la base fundamental para todas las decisiones posteriores del proyecto ETL, el diseño de mi Data Lake House, la construcción del modelo dimensional y los dashboards finales.
+    </p>
+  </div>
 
-Este documento resume el **Análisis Exploratorio de Datos (EDA)** realizado sobre el *Dataset Bancario Berka*. Este EDA fue la **base fundamental** para todas las decisiones posteriores del proyecto ETL, el diseño del Data Lake House, la construcción del modelo dimensional y los dashboards finales.
+  <div style="flex-shrink: 0;">
+    <img src="../img/logo-berka.png" alt="Logo Berka" width="150">
+  </div>
+
+</div>
 
 ---
 
@@ -8,7 +19,7 @@ Este documento resume el **Análisis Exploratorio de Datos (EDA)** realizado sob
 
 ## 📚 Librerías Utilizadas
 
-Se utilizaron las librerías estándar para análisis de datos en Python:
+Para explorar el dataset utilicé las librerías estándar de análisis de datos en Python:
 
 ```python
 import pandas as pd
@@ -17,13 +28,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 ```
 
-* **pandas** → lectura y exploración tabular
-* **numpy** → manipulación numérica
-* **matplotlib / seaborn** → visualizaciones
+* **pandas** → para la exploración tabular
+* **numpy** → para operaciones numéricas
+* **matplotlib / seaborn** → para generar visualizaciones y distribuciones
 
 ## 📦 Archivos Analizados
 
-El dataset incluye múltiples archivos independientes:
+El dataset Berka está compuesto por múltiples archivos separados, sin esquema y sin llaves relacionales explícitas:
 
 * `account.csv`
 * `client.csv`
@@ -34,32 +45,32 @@ El dataset incluye múltiples archivos independientes:
 * `order.csv`
 * `trans.csv`
 
-Cada uno viene **sin esquema definido**, con formatos inconsistentes y sin claves relacionales explícitas.
+Esto implicó un esfuerzo extra para reconstruir relaciones y estandarizar esquemas.
 
 ## 🧪 Estrategia de Muestreo
 
-Para evitar alto costo computacional (especialmente en `trans.csv`, con cientos de miles de filas):
+Para optimizar tiempos y evitar cargas innecesarias —sobre todo en `trans.csv`, que es masivo— tomé una **muestra del 5%**:
 
 ```python
 df_trans_sample = df_trans.sample(frac=0.05, random_state=42)
 ```
 
-➡️ Se tomó **el 5% de las tablas** para exploraciones preliminares.
+Gracias a esto pude analizar:
 
-Esto permitió analizar:
+* volumen de transacciones
+* montos atípicos
+* distribución temporal
+* comportamiento por tipo de operación
 
-* Volumen por tipo de transacción
-* Montos atípicos
-* Distribución de fechas
-* Patrones de actividad por cuenta
+Este muestreo fue clave para avanzar rápido sin perder representatividad.
 
 ---
 
 # 2. 🔍 Exploración por Tabla
 
-## 🟦 2.1. Tabla CLIENT
+## 🟦 2.1. CLIENT
 
-Variables clave:
+Variables relevantes:
 
 * `client_id`
 * `birth_number`
@@ -67,94 +78,100 @@ Variables clave:
 
 ### 🔑 Insight importante
 
-El campo `birth_number` contenía **el género y fecha de nacimiento comprimidos**, lo cual permitió crear:
+Descubrí que `birth_number` codifica **fecha de nacimiento y género**.
+A partir de eso generé:
 
-* **gender** (M/F)
-* **age** al momento del análisis (1998)
-* **age_segment** (clasificación útil para dashboard)
+* `gender`
+* `age`
+* `age_segment`
 
-Esta extracción fue esencial para el Feature Engineering posterior.
+Este hallazgo fue fundamental para el *Feature Engineering* y para los dashboards demográficos.
 
 ---
 
-## 🟧 2.2. Tabla LOAN
+## 🟧 2.2. LOAN
 
-Variables:
+Variables principales:
 
 * `loan_id`, `account_id`, `amount`, `duration`, `payments`, `status`
 
 ### 🔎 Insights
 
-* Distribución muy desigual del **monto del préstamo**.
-* Existencia de varios **status** (A, B, C, D) sin descripción.
-* Se detectó que **status = C y D son defaults / high risk**, insight clave para el dashboard.
-
-➡️ Esto llevó a crear la variable `is_risky` en la capa Curated.
+* Los montos estaban muy desbalanceados.
+* Los status (`A, B, C, D`) no venían documentados, pero pude inferir que **C y D representan riesgo / default**.
+* Este insight me llevó a crear la variable **`is_risky`** en la capa Curated.
 
 ---
 
-## 🟩 2.3. Tabla DISTRICT
+## 🟩 2.3. DISTRICT
 
-Incluye información socio-económica:
+Incluye variables socioeconómicas:
 
 * salario promedio
-* crimen
-* población
+* criminalidad
 * desempleo
+* población
 
 ### 🔎 Insights
 
-* Las regiones con **salario promedio más bajo** correlacionan con **mayor default**.
-* Información perfecta para enriquecer el Data Warehouse.
+Encontré correlaciones entre:
 
-➡️ Esto justificó la creación de la tabla dimensión `dim_district`.
+* **menor salario promedio** → mayores tasas de **default**
+* ciertos distritos con patrones de riesgo más marcados
+
+Esto justificó la creación de la dimensión **`dim_district`**.
 
 ---
 
-## 🟪 2.4. Tabla TRANS (muestra 5%)
+## 🟪 2.4. TRANS (5% sample)
 
-Contenía:
+Variables clave:
 
 * fecha
 * monto
-* tipo de operación
+* tipo
 * símbolo bancario
 
 ### 🔎 Insights
 
-* Existían **montos extremadamente altos** que requerían limpieza.
-* Algunos `k_symbol` no tenían significado → se imputó `UNKNOWN`.
-* Se detectaron patrones de gasto útiles para features:
+* Encontré outliers muy altos que requerían limpieza.
+* Algunos `k_symbol` no tenían interpretación → los clasifiqué como `UNKNOWN`.
+* Detecté patrones útiles para crear features como:
 
   * `avg_trans_amount_3m`
   * `initial_balance`
 
-➡️ Estos features fueron utilizados para el modelado dimensional.
+Estos features enriquecieron el modelo dimensional.
 
 ---
 
-# 3. 🎯 Hallazgos que Guiaron el ETL
+# 3. 🎯 Hallazgos que Guiaron Mi ETL
 
-Cada decisión del ETL provino directamente del EDA.
+El EDA no fue un documento aislado: **fue el mapa** que definió todas mis decisiones del pipeline.
 
 ## 🔧 Limpieza (RAW → PROCESSED)
 
-* Estandarizar nombres a `snake_case`.
-* Convertir fechas de `AAMMDD` → `YYYY-MM-DD`.
-* Imputación explícita de valores nulos.
-* Casting correcto de tipos.
+Implementé:
+
+* estandarización `snake_case`
+* conversiones de fecha
+* imputaciones explícitas
+* cast de tipos correctos
+* detección de outliers
 
 ## 🧬 Feature Engineering (PROCESSED → CURATED)
 
-* Extracción de género y edad.
-* Segmentos demográficos.
-* Balance inicial.
-* Montos promedio móviles.
-* Flag de riesgo crediticio.
+A partir de lo que encontré en el EDA generé:
+
+* extracción de género y edad
+* segmentos demográficos
+* balances iniciales
+* promedios móviles de transacciones
+* flag de riesgo crediticio
 
 ## 🏛️ Modelado Dimensional
 
-Creación de:
+Las tablas finales nacieron directamente del conocimiento exploratorio:
 
 * `dim_client`
 * `dim_loan`
@@ -163,24 +180,25 @@ Creación de:
 * `fact_account_transactions`
 * `fact_account_summary`
 
-Toda la estructura se definió gracias a los insights del EDA.
-
 ---
 
 # 4. 📊 Conclusiones del EDA
 
-### ✔️ El dataset contenía suficiente riqueza para construir un **modelo dimensional realista**.
+### ✔️ El dataset tenía suficiente riqueza para construir un **modelo dimensional completo y realista**.
 
-### ✔️ Fue necesario aplicar mucha limpieza debido a inconsistencias.
+### ✔️ Fue necesario un fuerte proceso de limpieza por inconsistencias de origen.
 
-### ✔️ Los hallazgos guiaron por completo el ETL:
+### ✔️ El EDA definió totalmente el camino del ETL:
 
-* extracción de features clave (edad, riesgo)
-* integración socioeconómica (salario / distrito)
-* cálculo de métricas financieras
+* features demográficos
+* métricas financieras
+* clasificación de riesgo
+* integración socioeconómica
 
-### ✔️ El EDA permitió definir el enfoque del dashboard:
+### ✔️ También definió el enfoque de mis dashboards:
 
-* Riesgo por monto
-* Riesgo demográfico
-* Sensibilidad regional
+* riesgo por monto
+* riesgo por edad
+* riesgo por región
+
+---

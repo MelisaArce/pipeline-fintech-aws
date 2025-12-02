@@ -25,7 +25,7 @@
 - 🔍 [EDA Completo](docs/eda.md)
 - 📊 [Análisis de Negocio](docs/analisis.md)
 - 🎨 [Metodología del Dashboard](docs/metodologia_dashboard.md)
-
+- 🏦 [Dashboard Conclusiones](docs/dashboard_conclusiones.md)
 
 ## 🏗️ Estructura del Proyecto
 

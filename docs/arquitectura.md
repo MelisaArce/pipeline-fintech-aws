@@ -13,7 +13,7 @@
 
 ## 📐 Diagrama de Arquitectura
 
-![descripcion](../img/Arquitectura-berka.drawio.png)
+![arquitectura completa](../img/Arquitectura-berka.drawio.png)
 
 La arquitectura se compone de cinco capas:
 
@@ -27,6 +27,8 @@ Esta separación por capas me permitió mantener trazabilidad y gobernanza duran
 ---
 
 # 1. 🎯 Visión General de la Arquitectura
+
+![arquitectura resumida](../img/berka_pipeline_fixed_v1.png)
 
 Desde el inicio decidí trabajar con un patrón **Data Lakehouse**, porque me permitía combinar:
 

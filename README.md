@@ -26,6 +26,7 @@
 - 📊 [Análisis de Negocio](docs/analisis.md)
 - 🎨 [Metodología del Dashboard](docs/metodologia_dashboard.md)
 - 🏦 [Dashboard Conclusiones](docs/dashboard_conclusiones.md)
+- 💰 [Optimizacion de Costos](docs/optimizacion_costos.md)
 
 ## 🏗️ Estructura del Proyecto
 

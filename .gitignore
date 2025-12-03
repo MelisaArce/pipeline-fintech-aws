@@ -93,3 +93,4 @@ util/*.log
 util/*.tmp
 util/__pycache__/
 utils/
+deprecated/

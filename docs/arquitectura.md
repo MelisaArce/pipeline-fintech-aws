@@ -108,6 +108,59 @@ Decidí cargar la capa Curated en MySQL RDS para brindar:
 Incluye creación automática de tablas + carga incremental/batch.
 
 ---
+Aquí tenés la versión **en primera persona**, con un tono **profesional y académico**, manteniendo toda la estructura y el contenido técnico pero narrado desde tu experiencia directa:
+
+---
+
+# Esquema Estrella (*Star Schema*)
+
+![arquitectura resumida](../img/Diagrama-er-estrella.drawio.png)
+
+## 1. ⭐️ Modelo de Warehouse: Star Schema (Esquema Estrella)
+
+En el *Data Warehouse* que diseñé sobre MySQL RDS, opté por implementar un modelo de **Esquema Estrella**. Elegí este enfoque porque ofrece una combinación ideal de **simplicidad estructural y alto rendimiento**, especialmente útil para entornos de Inteligencia de Negocio (BI). Esto me permite asegurar que las consultas consumidas desde QuickSight sean consistentes, rápidas y eficientes.
+
+| Característica                | Beneficio Clave                                                                                                                                                   |
+| :---------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Optimización de Consultas** | Simplifico el SQL reduciendo la cantidad de *joins* necesarios, lo que mejora significativamente la latencia del *dashboard*.                                     |
+| **Separación de Lógica**      | Mantengo una clara separación entre las **medidas** (hechos) y las **descripciones** (dimensiones), lo que facilita el mantenimiento y la comprensión del modelo. |
+| **Escalabilidad**             | Puedo añadir nuevas dimensiones o métricas sin requerir modificaciones estructurales profundas.                                                                   |
+
+---
+
+## 2. Tablas de Hechos (*Fact Tables*)
+
+Las Tablas de Hechos constituyen el núcleo del análisis que construí, ya que contienen los eventos medibles (montos, conteos y métricas derivadas).
+
+| Tabla de Hechos (3)             | Propósito de Negocio                                                                                                                                            | Granularidad                         |
+| :------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------- |
+| **`fact_transactions`**         | Registro cada movimiento financiero (ingresos, retiros y gastos). Esta tabla es clave para identificar anomalías o comportamientos atípicos.                    | Transacción individual               |
+| **`fact_account_transactions`** | Agrupo las métricas por cuenta (suma de ingresos, egresos, ratio entre ambos, etc.). Esta tabla me permite medir la salud financiera desde un enfoque agregado. | Cuenta (vista agregada en el tiempo) |
+| **`fact_loan_dispositions`**    | Capturo el estado de cada préstamo, lo cual es fundamental para medir el cumplimiento, el *status* y calcular el **capital en incumplimiento**.                 | Préstamo (estado final)              |
+
+---
+
+## 3. Tablas de Dimensión 
+
+Las Tablas de Dimensión son las que me permiten contextualizar los hechos: responden a las preguntas *quién*, *dónde*, *cuándo* y *cómo*.
+
+| Tabla de Dimensión (7)     | Contenido Clave                                                                                        | Relación con Hechos                                              |
+| :------------------------- | :----------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- |
+| **`dim_client`**           | Incluyo información demográfica del cliente (género, segmentación por edad).                           | Se relaciona con `fact_transactions` y `fact_loan_dispositions`. |
+| **`dim_account`**          | Contiene los datos maestros de cada cuenta (antigüedad, frecuencia).                                   | Se relaciona con todas las tablas de hechos.                     |
+| **`dim_district`**         | Agrego información geográfica y socioeconómica (región, salario promedio, desempleo).                  | Se vincula con `dim_account`.                                    |
+| **`dim_loan`**             | Registro las características del préstamo (monto, duración, fecha de inicio).                          | Relacionado con `fact_loan_dispositions`.                        |
+| **`dim_card`**             | Describo el tipo de tarjeta asignada al cliente.                                                       | Apoya análisis sobre transacciones específicas.                  |
+| **`dim_date`**             | Modelo la dimensión temporal (día, semana, mes, año) para permitir análisis evolutivos y estacionales. | Relacionada con todas las tablas de hechos.                      |
+| **`dim_transaction_type`** | Incluye el contexto de la transacción (tipo de operación).                                             | Relacionada con `fact_transactions`.                             |
+
+---
+
+### **Resumen**
+
+El *Star Schema* que implementé me permite que todo el trabajo de *Feature Engineering* realizado en las tablas de hechos pueda analizarse rápida y eficientemente bajo cualquier dimensión relevante: cliente, cuenta, geografía, tiempo o tipo de operación. Este diseño asegura flexibilidad para nuevos análisis y un rendimiento óptimo para las herramientas de BI.
+
+---
 
 # 4. 🎛️ Infraestructura como Código (IaC) — CloudFormation
 

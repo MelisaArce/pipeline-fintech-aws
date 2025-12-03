@@ -538,36 +538,3 @@ if __name__ == "__main__":
     if EXECUTION_MODE == 'GLUE':
         job.commit()
 
-
-
-# #arreglar:
-# # Ejemplo en PySpark/Glue:
-# df_dim_account = df_dim_account.withColumn(
-#     "district_id",
-#     col("district_id").cast(IntegerType()) # <--- Asegura que se escriba como INT
-# )
-
-# # Luego, escribe el DataFrame:
-# df_dim_account.write.mode("overwrite").parquet(...)
-
-
-# def enrich_account_dimension(df_account: DataFrame, df_district: DataFrame, 
-#                             df_disp: DataFrame, df_client: DataFrame) -> DataFrame:
-#     """Enriquece ACCOUNT con información completa"""
-    
-#     # ====================================================================
-#     # 💥 CORRECCIÓN CRÍTICA: Castear district_id de STRING a INTEGER.
-#     # Esto soluciona el error de tipo ('varchar', 'integer') en el JOIN 
-#     # y asegura que la columna se guarde correctamente en la capa Curated.
-#     # ====================================================================
-#     df_account = df_account.withColumn(
-#         "district_id", 
-#         col("district_id").cast(IntegerType())
-#     )
-    
-#     # Join con district
-#     df = df_account.join(df_district, "district_id", "left")
-    
-#     # Obtener owner
-#     df_owners = df_disp.filter(col("type") == "OWNER") \
-# # ... el resto del código es igual ...
